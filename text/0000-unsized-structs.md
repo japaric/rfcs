@@ -252,12 +252,12 @@ mem::size_of::<*const Mat<f32>>();  // 24 bytes
 
 `unsized` structs must fulfill the following requirements:
 
+- The first field of the struct must be a *thin* raw pointer
 - All its fields must be `Copy`.
     - Rationale: The raw representation must be `Copy` because the fat pointers: `&Unsized`,
       `*const Unsized` are `Copy`
 - All its fields must be `Sized`.
 - All its fields must be private (not marked with `pub`).
-- The struct must contain at least one raw pointer
 
 NOTE This set of restrictions is not final and may change/grow/shrink as we gain experience with
 the feature.
@@ -341,7 +341,7 @@ fn mk_mat<'a, T>() -> &'a Mat<T> {
 }
 ```
 
-## Field access
+## Field access and destructuring
 
 As long as privacy allows, the fields of a fat pointer can be accessed with the normal field access
 syntax.
@@ -371,6 +371,84 @@ impl<T> Drop for Mat<T> {
     }
 }
 ```
+
+## Destructors [WIP]
+
+It should be possible to do the following:
+
+```
+unsized struct Mat<T> {
+    data: *mut T,
+    nrows: usize,
+    ncols: usize,
+}
+
+impl<T> Mat<T> {
+    fn new(mut elems: Box<[T]>, (nrows, ncols): (usize, usize)) -> Box<Mat<T>> {
+        unsafe {
+            assert_eq!(elems.len(), nrows * ncols);
+
+            let data = elems.as_mut_ptr();
+            mem::forget(elems);
+
+            Mat {
+                data: data,
+                nrows: nrows,
+                ncols: ncols,
+            }
+        }
+    }
+}
+
+impl<T> Drop for Mat<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let len = self.nrows * self.ncols;
+            mem::drop(Vec::from_raw_parts(ptr, len, len))
+        }
+    }
+}
+
+let m: Box<Mat<i32>> = Mat::new(Box::new([0, 1, 2, 3, 4, 5]), (2, 3));
+// This calls `Mat::drop`
+mem::drop(m);
+```
+
+This would let us use reference counting with `Mat`:
+
+``` rust
+struct Rc<T: ?Sized> {
+    data: *mut T,
+    count: *mut Cell<usize>,
+}
+
+impl<T: ?Sized> From<Box<T>> for Rc<T> {
+    fn from(boxed: Box<T>) -> Rc<T> {
+        unsafe {
+            Rc {
+                count: boxed::into_raw(Box::new(Cell::new(1))),
+                data: boxed::into_raw(boxed),
+            }
+        }
+    }
+}
+
+impl<T: ?Sized> Drop for Rc<T> {
+    fn drop(&mut self) {
+        unsafe {
+            self.dec_count();
+
+            if self.count() == 0 {
+                mem::drop(Box::from_raw(self.count));
+                mem::drop(Box::from_raw(self.data));
+            }
+        }
+    }
+}
+```
+
+XXX I'm unclear how to make this work with libstd's `Rc`/`Arc`, because those two work with DST via
+compiler magic.
 
 ## Potential users in libstd
 
@@ -415,6 +493,85 @@ impl<T> !Sized for Mat<T> {}
 ```
 
 Another option is to use a marker like `std::marker::Unsized`.
+
+## Decouple unsized type from its raw representation
+
+In the original proposal the `unsized struct` takes both roles of being the unsized type and its
+raw representation, this makes it hard to expose the raw representation as part of the public API
+as one would need to add a second struct and mess with transmutes:
+
+``` rust
+// We need to freeze the representation to ensure transmutes will work
+#[repr(C)]
+pub unsized struct Mat<T> {
+    data: *mut T,
+    nrows: usize,
+    ncols: usize,
+}
+
+impl<T> Mat<T> {
+    fn repr(&self) -> raw::Mat<T> {
+        unsafe {
+            mem::transmute(self)
+        }
+    }
+}
+
+pub mod raw {
+    // Here we need to be very careful to repeat the same layout of the unsized `Mat`
+    #[repr(C)]
+    pub struct Mat<T> {
+        pub data: *mut T,
+        pub nrows: usize,
+        pub ncols: usize,
+    }
+}
+```
+
+This alternative design solves the problem by decoupling the unsized typed from its raw
+representation:
+
+``` rust
+// Raw representation, this is equivalent to `std::raw::Slice`
+[pub] struct RawSlice<T> { [pub] data: *const T, [pub] len: usize }
+
+// `Slice<T>` is the unsized type, and `RawSlice<T>` is its raw representation
+// `Slice<T>` is equivalent to `[T]`
+[pub] unsized type Slice<T> = RawSlice<T>;
+
+impl<T> Slice<T> {
+    [pub] fn repr(&self) -> RawSlice<T> {
+        self
+    }
+}
+```
+
+All the semantics of the original proposal remain, the "all the field of the raw representation
+must be private" restriction is no longer necessary, but we get a new restriction:
+
+- Both the unsized type and its raw representation must be defined in the same crate.
+
+XXX How to dealt with cases where the unsized type and its raw representation are defined in
+different modules? Under which scope should coercions be allowed?
+
+``` rust
+unsized type Slice<T> = raw::Slice<T>;
+
+impl<T> Slice<T> {
+    fn empty() -> &'static Slice<T> {
+        // do we allow coercions here?
+        // what about the reverse case, raw repr defined here, and unsized type defined "below"?
+        raw::Slice {
+            data: SOME_ADDRESS,
+            len: 0,
+        }
+    }
+}
+
+mod raw {
+    pub struct Slice<T> { pub data: *const T, pub len: usize }
+}
+```
 
 # Unresolved questions
 
